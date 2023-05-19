@@ -1,0 +1,88 @@
+- name: Create input file from workflow artifact if variable set
+  ansible.builtin.copy:
+    content: "{{ pcv_output }}"
+    dest: "{{ input_file }}"
+    mode: '0644'
+  when: pcv_output is defined and awx_job_id is defined
+
+- name: Read input file
+  ansible.builtin.stat:
+    path: "{{ input_file }}"
+  register: file_stat
+
+- name: Validate input file
+  ansible.builtin.assert:
+    that:
+      - file_stat.stat.exists == true
+      - file_stat.stat.size > 0
+    success_msg: "Pre-Change Validation - Input File is Valid"
+    fail_msg: "Pre-Change Validation - No proposed changes found, input file is empty or not present. Stopping"
+
+- name: Delete existing Pre-change Analysis job if present
+  cisco.nd.nd_pcv:
+    insights_group: "{{ insights_group }}"
+    name: "{{ job_name }}"
+    site_name: "{{ site_name }}"
+    state: absent
+  register: deleted_job
+  ignore_errors: true
+
+# - name: Pause for 30s to complete deletion
+#   ansible.builtin.pause:
+#     seconds: 30
+
+- name: Create new Nexus Dashboard Insights (NDI) Pre-Change Validation (PCV) Job
+  cisco.nd.nd_pcv:
+    insights_group: "{{ insights_group }}"
+    name: "{{ job_name }}"
+    site_name: "{{ site_name }}"
+    description: Pre-Changed Validation job created by Ansible CI/CD Workflow
+    file: "{{ input_file }}"
+    state: present
+  register: pcv_job
+
+- name: Wait for PCV job to complete (up to 30min)
+  cisco.nd.nd_pcv:
+    insights_group: "{{ insights_group }}"
+    name: "{{ job_name }}"
+    site_name: "{{ site_name }}"
+    state: query
+  register: query_pcv_job
+  until:
+    - query_pcv_job.current is defined
+    - query_pcv_job.current.analysisStatus is defined
+    - query_pcv_job.current.analysisStatus == "COMPLETED"
+  retries: 180
+  delay: 10
+
+# - name: Pause for 1 minute to complete Pre-Change Analysis
+#   ansible.builtin.pause:
+#     minutes: 1
+
+- name: Query completed Pre-Change Validation Delta Analysis results
+  cisco.nd.nd_pcv_delta_analysis:
+    insights_group: "{{ insights_group }}"
+    name: "{{ job_name }}"
+    site_name: "{{ site_name }}"
+    state: validate
+    exclude_ack_anomalies: true
+    epoch_choice: epoch2
+  register: pcv_delta_results
+  # ignore_errors: true ## Allow moving to approval with new anomalies!
+
+- name: Set Pre-Change Validation Delta Analysis results as variable
+  ansible.builtin.set_stats:
+    data:
+      pcv_delta_results: "{{ pcv_delta_results }}"
+  when: awx_job_id is defined
+
+- name: Validation of Pre-Change Analysis results
+  ansible.builtin.assert:
+    that:
+      - pcv_delta_results.current.anomaly_count.critical.epoch2_only == 0
+      - pcv_delta_results.current.anomaly_count.major.epoch2_only == 0
+      - pcv_delta_results.current.anomaly_count.minor.epoch2_only == 0
+      - pcv_delta_results.current.anomaly_count.warning.epoch2_only == 0
+    success_msg: "Pre-Change Validation - Delta Analysis successful, no new anomalies found"
+    fail_msg: "Pre-Change Validation - Delta Analysis failed, new anomalies have been found"
+  when: awx_job_id is not defined
